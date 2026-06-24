@@ -1,0 +1,139 @@
+version: "3.9"
+
+networks:
+  edge_ai_net:
+    driver: bridge
+
+volumes:
+  model_weights:
+  mlflow_data:
+  results_data:
+  redis_data:
+
+services:
+
+  # ── Backend API ─────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.backend
+    image: edge-ai-detection/backend:latest
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      DEVICE: cpu         # Change to cuda for GPU
+      DEFAULT_MODEL: yolov8n
+      CONFIDENCE_THRESHOLD: "0.25"
+      IOU_THRESHOLD: "0.45"
+      DETECTION_MODE: all
+      ENABLE_TRACKING: "true"
+      TRACKER: bytetrack
+      SECRET_KEY: ${SECRET_KEY:-change-this-in-production}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      ALERT_EMAIL: ${ALERT_EMAIL:-}
+      MLFLOW_TRACKING_URI: sqlite:////app/mlflow/mlflow.db
+    volumes:
+      - model_weights:/app/models/weights
+      - mlflow_data:/app/mlflow
+      - results_data:/app/results
+      - ./configs:/app/configs:ro
+    ports:
+      - "8000:8000"
+    networks: [edge_ai_net]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Backend (GPU variant) ────────────────────────────────────────────────────
+  backend-gpu:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.backend-gpu
+    image: edge-ai-detection/backend-gpu:latest
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      DEVICE: cuda:0
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - model_weights:/app/models/weights
+      - mlflow_data:/app/mlflow
+      - results_data:/app/results
+    ports:
+      - "8001:8000"
+    networks: [edge_ai_net]
+    profiles: ["gpu"]
+
+  # ── Frontend Dashboard ───────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: deployment/docker/Dockerfile.frontend
+    image: edge-ai-detection/frontend:latest
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    networks: [edge_ai_net]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # ── MLflow Tracking Server ───────────────────────────────────────────────────
+  mlflow:
+    image: python:3.11-slim
+    restart: unless-stopped
+    command: >
+      bash -c "pip install mlflow -q &&
+               mlflow server
+               --backend-store-uri sqlite:////mlflow/mlflow.db
+               --default-artifact-root /mlflow/artifacts
+               --host 0.0.0.0 --port 5000"
+    volumes:
+      - mlflow_data:/mlflow
+    ports:
+      - "5000:5000"
+    networks: [edge_ai_net]
+
+  # ── Redis (cache + task queue) ───────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks: [edge_ai_net]
+    ports:
+      - "6379:6379"
+
+  # ── Prometheus Metrics ───────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.54.0
+    restart: unless-stopped
+    volumes:
+      - ./deployment/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks: [edge_ai_net]
+    ports:
+      - "9090:9090"
+    profiles: ["monitoring"]
+
+  # ── Grafana Dashboard ────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_FEATURE_TOGGLES_ENABLE: publicDashboards
+    volumes:
+      - ./deployment/monitoring/grafana:/etc/grafana/provisioning
+    networks: [edge_ai_net]
+    depends_on: [prometheus]
+    ports:
+      - "3001:3000"
+    profiles: ["monitoring"]
